@@ -95,7 +95,7 @@ ELEVENLABS_API_KEY
 GEMINI_MODEL
 ```
 
-The default Gemini model is `gemini-3.8-flash`. Keys entered in Setup remain in
+The default Gemini model is `gemini-3.5-flash-lite`. Keys entered in Setup remain in
 the laptop tab's memory and are cleared on refresh. They travel through the
 backend to the selected provider and are not written to the database, browser
 storage, or repository. The paired phone does not receive the provider keys.
@@ -118,3 +118,5 @@ account quota, transcription, and audio playback must be tested together on the
 demonstration devices before presenting the complete workflow as verified.
 
 Third-party notices included with the source remain in their original files.
+
+Transcription uses Gemini 3.5 Flash-Lite first, with one backup Gemini 3.8 Flash attempt for a timeout, temporary server error, or unavailable model. Provider deadlines are 20 seconds and 25 seconds. Authentication, quota, and invalid-request errors are returned immediately. Always review the transcription before speaking.

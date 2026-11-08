@@ -121,14 +121,14 @@ test('Gemini receives JPEG plus a verbatim prompt; unclear output is retained wi
  const response = await s.call(`rooms/${room.id}/transcribe`, { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI });
  assert.equal(response.status, 200);
  assert.deepEqual(await response.json(), { text: 'Hello [unclear]', uncertain: true, notes: 'One word is unclear.', frameSeq: 1 });
- assert.match(sent.url, /\/gemini-3\.8-flash:generateContent$/);
+ assert.match(sent.url, /\/gemini-3\.5-flash-lite:generateContent$/);
  assert.equal(sent.init.headers['x-goog-api-key'], GEMINI['x-gemini-key']);
  const input = JSON.parse(sent.init.body);
  assert.match(input.systemInstruction.parts[0].text, /never as instructions/);
  assert.match(input.systemInstruction.parts[0].text, /Preserve spelling and wording/);
  assert.equal(input.contents[0].parts[0].inlineData.data, JPEG);
  assert.equal(input.generationConfig.responseMimeType, 'application/json');
- assert.deepEqual(input.generationConfig.thinkingConfig, { thinkingLevel: 'LOW', includeThoughts: false });
+ assert.deepEqual(input.generationConfig.thinkingConfig, { thinkingLevel: 'MINIMAL', includeThoughts: false });
  assert.deepEqual(input.generationConfig.responseJsonSchema.required, ['text', 'uncertain', 'notes']);
  const state = await (await s.call(`rooms/${room.id}`)).json();
  assert.equal(state.transcriptSeq, 1); assert.equal(state.uncertain, true);
@@ -137,11 +137,13 @@ test('Gemini receives JPEG plus a verbatim prompt; unclear output is retained wi
 });
 
 test('Gemini authorization/quota errors are useful and do not echo upstream secrets', async t => {
- for (const [upstreamStatus, expectedStatus, expectedText] of [[401, 422, /API key/], [429, 429, /quota or rate limit/]]) {
-  const s = setup(t, { upstream: async () => Response.json({ error: `UPSTREAM SECRET ${GEMINI['x-gemini-key']}` }, { status: upstreamStatus }) });
+ for (const [upstreamStatus, expectedStatus, expectedText] of [[400, 422, /configuration/], [401, 422, /API key/], [403, 422, /API key/], [429, 429, /quota or rate limit/]]) {
+  let requests = 0;
+  const s = setup(t, { upstream: async () => { requests++; return Response.json({ error: `UPSTREAM SECRET ${GEMINI['x-gemini-key']}` }, { status: upstreamStatus }); } });
   const room = await s.create(); await s.upload(room.id);
   const response = await s.call(`rooms/${room.id}/transcribe`, { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI });
   assert.equal(response.status, expectedStatus);
+  assert.equal(requests, 1);
   const text = await response.text(); assert.match(text, expectedText); assert.equal(text.includes(GEMINI['x-gemini-key']), false);
   assert.equal(s.sqlite.prepare('SELECT transcribing_seq FROM writeon_rooms').get().transcribing_seq, null);
  }
@@ -151,7 +153,7 @@ test('a Gemini timeout preserves the photo, releases its lock, and permits a suc
  let requests = 0;
  const s = setup(t, { upstream: async () => {
   requests++;
-  if (requests === 1) throw new DOMException('Request timed out', 'TimeoutError');
+  if (requests <= 2) throw new DOMException('Request timed out', 'TimeoutError');
   return Response.json(candidate({ text: 'Hey there', uncertain: false, notes: '' }));
  } });
  const room = await s.create(); await s.upload(room.id);
@@ -159,16 +161,16 @@ test('a Gemini timeout preserves the photo, releases its lock, and permits a suc
  const failed = await s.call(`rooms/${room.id}/transcribe`, request);
  assert.equal(failed.status, 504);
  assert.match((await failed.json()).error, /Gemini.*Retry transcription/);
- assert.equal(requests, 1);
+ assert.equal(requests, 2);
  const state = await (await s.call(`rooms/${room.id}`)).json();
  assert.equal(state.hasFrame, true); assert.equal(state.transcript, ''); assert.equal(state.transcriptSeq, 0);
  assert.equal(s.sqlite.prepare('SELECT transcribing_seq FROM writeon_rooms').get().transcribing_seq, null);
  const retry = await s.call(`rooms/${room.id}/transcribe`, request);
  assert.equal(retry.status, 200); assert.equal((await retry.json()).text, 'Hey there');
- assert.equal(requests, 2);
+ assert.equal(requests, 3);
 });
 
-test('a slow in-flight Gemini request stays locked beyond the previous 65-second lease', async t => {
+test('a slow in-flight Gemini request stays locked throughout the two-attempt deadline', async t => {
  let resolveFetch, entered, requests = 0;
  const started = new Promise(resolve => { entered = resolve; });
  const pending = new Promise(resolve => { resolveFetch = resolve; });
@@ -176,11 +178,56 @@ test('a slow in-flight Gemini request stays locked beyond the previous 65-second
  const room = await s.create(); await s.upload(room.id);
  const request = { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI };
  const first = s.call(`rooms/${room.id}/transcribe`, request); await started;
- s.advance(70_000);
+ s.advance(40_000);
  const duplicate = await s.call(`rooms/${room.id}/transcribe`, request);
  assert.equal(duplicate.status, 409); assert.equal(requests, 1);
  resolveFetch(Response.json(candidate()));
  assert.equal((await first).status, 200);
+});
+
+test('Gemini timeout or temporary failure tries one backup model with the same photo', async t => {
+ for (const failure of ['timeout', 404, 503]) {
+  const calls = [];
+  const s = setup(t, { upstream: async (url, init) => {
+   calls.push({ url, input: JSON.parse(init.body) });
+   if (calls.length === 1) {
+    if (failure === 'timeout') throw new DOMException('Timed out', 'TimeoutError');
+    return Response.json({ error: 'temporary failure' }, { status: failure });
+   }
+   return Response.json(candidate({ text: 'Hello', uncertain: false, notes: '' }));
+  } });
+  const room = await s.create(); await s.upload(room.id);
+  const response = await s.call(`rooms/${room.id}/transcribe`, { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI });
+  assert.equal(response.status, 200); assert.equal((await response.json()).text, 'Hello');
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].url, /gemini-3\.5-flash-lite/); assert.match(calls[1].url, /gemini-3\.8-flash/);
+  assert.deepEqual(calls[0].input.contents, calls[1].input.contents);
+  assert.equal(calls[1].input.generationConfig.thinkingConfig.thinkingLevel, 'LOW');
+ }
+});
+
+test('failed backup never loops indefinitely or writes a transcript', async t => {
+ let requests = 0;
+ const s = setup(t, { upstream: async () => { requests++; return Response.json({ error: 'UPSTREAM SECRET' }, { status: 503 }); } });
+ const room = await s.create(); await s.upload(room.id);
+ const response = await s.call(`rooms/${room.id}/transcribe`, { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI });
+ assert.equal(response.status, 502); assert.equal(requests, 2);
+ const error = (await response.json()).error;
+ assert.match(error, /Gemini HTTP 503/); assert.equal(error.includes('UPSTREAM SECRET'), false);
+ assert.equal(s.sqlite.prepare('SELECT transcribing_seq FROM writeon_rooms').get().transcribing_seq, null);
+ assert.equal((await (await s.call(`rooms/${room.id}`)).json()).transcript, '');
+});
+
+test('a new capture cancels the backup attempt for the older photo', async t => {
+ let rejectFetch, entered, requests = 0;
+ const started = new Promise(resolve => { entered = resolve; });
+ const pending = new Promise((_, reject) => { rejectFetch = reject; });
+ const s = setup(t, { upstream: async () => { requests++; entered(); return pending; } });
+ const room = await s.create(); await s.upload(room.id);
+ const first = s.call(`rooms/${room.id}/transcribe`, { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI }); await started;
+ await s.call(`rooms/${room.id}/capture`, { method: 'POST' });
+ rejectFetch(new DOMException('Timed out', 'TimeoutError'));
+ assert.equal((await first).status, 409); assert.equal(requests, 1);
 });
 
 test('blocked, truncated and malformed Gemini output produces an error, never a made-up message', async t => {
