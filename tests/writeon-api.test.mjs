@@ -128,6 +128,7 @@ test('Gemini receives JPEG plus a verbatim prompt; unclear output is retained wi
  assert.match(input.systemInstruction.parts[0].text, /Preserve spelling and wording/);
  assert.equal(input.contents[0].parts[0].inlineData.data, JPEG);
  assert.equal(input.generationConfig.responseMimeType, 'application/json');
+ assert.deepEqual(input.generationConfig.thinkingConfig, { thinkingLevel: 'LOW', includeThoughts: false });
  assert.deepEqual(input.generationConfig.responseJsonSchema.required, ['text', 'uncertain', 'notes']);
  const state = await (await s.call(`rooms/${room.id}`)).json();
  assert.equal(state.transcriptSeq, 1); assert.equal(state.uncertain, true);
@@ -144,6 +145,42 @@ test('Gemini authorization/quota errors are useful and do not echo upstream secr
   const text = await response.text(); assert.match(text, expectedText); assert.equal(text.includes(GEMINI['x-gemini-key']), false);
   assert.equal(s.sqlite.prepare('SELECT transcribing_seq FROM writeon_rooms').get().transcribing_seq, null);
  }
+});
+
+test('a Gemini timeout preserves the photo, releases its lock, and permits a successful retry', async t => {
+ let requests = 0;
+ const s = setup(t, { upstream: async () => {
+  requests++;
+  if (requests === 1) throw new DOMException('Request timed out', 'TimeoutError');
+  return Response.json(candidate({ text: 'Hey there', uncertain: false, notes: '' }));
+ } });
+ const room = await s.create(); await s.upload(room.id);
+ const request = { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI };
+ const failed = await s.call(`rooms/${room.id}/transcribe`, request);
+ assert.equal(failed.status, 504);
+ assert.match((await failed.json()).error, /Gemini.*Retry transcription/);
+ assert.equal(requests, 1);
+ const state = await (await s.call(`rooms/${room.id}`)).json();
+ assert.equal(state.hasFrame, true); assert.equal(state.transcript, ''); assert.equal(state.transcriptSeq, 0);
+ assert.equal(s.sqlite.prepare('SELECT transcribing_seq FROM writeon_rooms').get().transcribing_seq, null);
+ const retry = await s.call(`rooms/${room.id}/transcribe`, request);
+ assert.equal(retry.status, 200); assert.equal((await retry.json()).text, 'Hey there');
+ assert.equal(requests, 2);
+});
+
+test('a slow in-flight Gemini request stays locked beyond the previous 65-second lease', async t => {
+ let resolveFetch, entered, requests = 0;
+ const started = new Promise(resolve => { entered = resolve; });
+ const pending = new Promise(resolve => { resolveFetch = resolve; });
+ const s = setup(t, { upstream: async () => { requests++; entered(); return pending; } });
+ const room = await s.create(); await s.upload(room.id);
+ const request = { method: 'POST', input: { frameSeq: 1 }, headers: GEMINI };
+ const first = s.call(`rooms/${room.id}/transcribe`, request); await started;
+ s.advance(70_000);
+ const duplicate = await s.call(`rooms/${room.id}/transcribe`, request);
+ assert.equal(duplicate.status, 409); assert.equal(requests, 1);
+ resolveFetch(Response.json(candidate()));
+ assert.equal((await first).status, 200);
 });
 
 test('blocked, truncated and malformed Gemini output produces an error, never a made-up message', async t => {
